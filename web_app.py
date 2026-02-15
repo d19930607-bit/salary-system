@@ -3,18 +3,15 @@ import pandas as pd
 from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from openpyxl import Workbook
-from openpyxl.styles import Font, Border, Side, Alignment, PatternFill
-from openpyxl.utils import get_column_letter
-import io
 import time
 
 # --- 設定檔 ---
 JSON_FILE = "service_account.json"
 SHEET_NAME = "工務薪資系統_資料庫"
 ALLOWANCE_PER_DAY = 200
+COST_PER_WORKER = 3200 # 新增：案場粗估成本單價
 
-# --- 連線設定 (V74 修正：支援雲端 Secrets) ---
+# --- 連線設定 (保留你原本穩定的版本) ---
 @st.cache_resource
 def init_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -42,7 +39,7 @@ def get_sheet(client, name):
         st.cache_resource.clear()
         return init_connection().open(SHEET_NAME).worksheet(name)
 
-# --- 資料讀取 ---
+# --- 資料讀取 (保留你原本穩定的版本) ---
 def load_data():
     client = init_connection()
     s_emp = get_sheet(client, "員工資料")
@@ -60,191 +57,16 @@ def load_data():
     
     return employees, salary_map, locations, work_details, money_items, work_rows, s_work, s_emp, emp_rows
 
-# --- Excel 報表邏輯 ---
-def generate_excel(year, work_rows, employees):
-    data = [r[:9] for r in work_rows[1:] if len(r)>=9]
-    df = pd.DataFrame(data, columns=['日期','姓名','地點','工時','日薪','津貼','備註','金額','類型'])
-    df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
-    for c in ['工時','日薪','津貼','金額']: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-    df.loc[df['類型'] == '月結輸入', '類型'] = '扣款'
-
-    wb = Workbook()
-    ft_head = Font(name='微軟正黑體', size=14, bold=True)
-    ft_bold = Font(name='微軟正黑體', bold=True)
-    ft_red = Font(name='微軟正黑體', bold=True, color="FF0000")
-    ft_blue = Font(name='微軟正黑體', bold=True, color="0000FF")
-    bd = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-    fill_head = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-    align_c = Alignment(horizontal="center", vertical="center")
-
-    # 1. 年度總表
-    ws_y = wb.active; ws_y.title = "年度總表"
-    ws_y.merge_cells("A1:F1"); c=ws_y.cell(1,1,"【年度員工薪資總結】"); c.font=ft_head
-    headers = ["姓名", "總天數", "總工資", "總津貼", "總扣款", "實支總額"]
-    for i, h in enumerate(headers, 1):
-        c = ws_y.cell(2, i, h); c.font = ft_bold; c.border = bd; c.fill = fill_head; c.alignment = align_c
-        ws_y.column_dimensions[get_column_letter(i)].width = 15
-    
-    df_year = df[df['日期'].dt.year == int(year)]
-    yr_row = 3
-    for p in employees:
-        if p not in df_year['姓名'].values: continue
-        p_d = df_year[df_year['姓名'] == p]
-        work = p_d[p_d['類型'] == '手動登錄']; deduct = p_d[p_d['類型'] == '扣款']; bonus = p_d[p_d['類型'] == '獎金']
-        t_d = work['工時'].sum(); w_s = (work['工時']*work['日薪']).sum(); f_s = (work['工時']*ALLOWANCE_PER_DAY).sum()
-        d_s = deduct['金額'].sum(); b_s = bonus['金額'].sum(); net = w_s + f_s + b_s - d_s
-        vals = [p, t_d, w_s, f_s + b_s, d_s, net]
-        for i, v in enumerate(vals, 1): ws_y.cell(yr_row, i, v).border = bd; ws_y.cell(yr_row, i).alignment = align_c
-        yr_row += 1
-    
-    site_row = yr_row + 2
-    ws_y.merge_cells(f"A{site_row}:D{site_row}"); c=ws_y.cell(site_row,1,"【年度案場總結】"); c.font=ft_head
-    site_heads = ["案場名稱", "總施工天數", "總出工人數", "總人次(工)"]
-    for i, h in enumerate(site_heads, 1):
-        c = ws_y.cell(site_row+1, i, h); c.font = ft_bold; c.border = bd; c.fill = fill_head; c.alignment = align_c
-        ws_y.column_dimensions[get_column_letter(i)].width = 18
-    
-    site_stats = df_year[df_year['類型']=='手動登錄'].groupby('地點').agg({'日期':'nunique', '姓名':'nunique', '工時':'sum'}).reset_index()
-    site_data_row = site_row + 2
-    for _, r in site_stats.iterrows():
-        vals = [r['地點'], r['日期'], r['姓名'], r['工時']]
-        for i, v in enumerate(vals, 1): ws_y.cell(site_data_row, i, v).border = bd; ws_y.cell(site_data_row, i).alignment = align_c
-        site_data_row += 1
-
-    # 2. 月份報表
-    for m in range(1, 13):
-        df_m = df[(df['日期'].dt.year == int(year)) & (df['日期'].dt.month == m)]
-        if df_m.empty: continue
-        ws = wb.create_sheet(f"{m}月")
-        active_emp = [p for p in employees if p in df_m['姓名'].unique()]
-        
-        # A. 薪資明細
-        ws.merge_cells("A1:G1"); c=ws.cell(1,1,"【薪資明細】"); c.font=ft_head
-        month_bonuses = sorted(df_m[df_m['類型']=='獎金']['備註'].unique())
-        month_deducts = sorted(df_m[df_m['類型']=='扣款']['備註'].unique())
-        month_adjusts = sorted(df_m[df_m['類型']=='薪資調整']['備註'].unique())
-        all_labels = ["總天數", "日薪", "工資小計", "便當飲料", "小計"] + month_bonuses + month_deducts + month_adjusts + ["實支總額"]
-        
-        for i, lab in enumerate(all_labels):
-            r = i + 3; c = ws.cell(r, 1, lab); c.border=bd; c.alignment=align_c
-            if lab in ["便當飲料", "小計"] or lab in month_bonuses: c.font = ft_blue
-            if lab in month_deducts: c.font = ft_red
-            if lab == "實支總額": c.font = ft_bold
-            if lab in month_adjusts: c.font = ft_bold
-        ws.column_dimensions['A'].width = 20
-        
-        curr_col = 2
-        col_map = {}
-        for p in active_emp:
-            ws.merge_cells(start_row=2, start_column=curr_col, end_row=2, end_column=curr_col+1)
-            c_head = ws.cell(2, curr_col, f"{int(year)-1911}年{m}月   {p}")
-            c_head.font = ft_bold; c_head.alignment = align_c; c_head.border = bd; ws.cell(2, curr_col+1).border = bd
-            
-            p_data = df_m[df_m['姓名'] == p]
-            work = p_data[p_data['類型'] == '手動登錄']
-            deduct_df = p_data[p_data['類型'] == '扣款']
-            bonus_df = p_data[p_data['類型'] == '獎金']
-            adjust_df = p_data[p_data['類型'] == '薪資調整']
-            
-            t_days = work['工時'].sum(); t_rate = work['日薪'].max()
-            w_sum = (work['工時']*work['日薪']).sum(); f_s = (work['工時']*ALLOWANCE_PER_DAY).sum()
-            sub_1 = w_sum + f_s
-            
-            vals = [t_days, t_rate, w_sum, f_s, sub_1]
-            styles = [None, None, None, ft_blue, ft_blue]
-            current_r = 3
-            for v, s in zip(vals, styles):
-                ws.merge_cells(start_row=current_r, start_column=curr_col, end_row=current_r, end_column=curr_col+1)
-                c_val = ws.cell(current_r, curr_col, v); c_val.border = bd; c_val.alignment = align_c
-                if s: c_val.font = s
-                ws.cell(current_r, curr_col+1).border = bd
-                current_r += 1
-                
-            for b_item in month_bonuses:
-                amt = bonus_df[bonus_df['備註']==b_item]['金額'].sum()
-                val = amt if amt > 0 else ""
-                ws.merge_cells(start_row=current_r, start_column=curr_col, end_row=current_r, end_column=curr_col+1)
-                c_val = ws.cell(current_r, curr_col, val); c_val.border = bd; c_val.alignment = align_c; c_val.font = ft_blue
-                ws.cell(current_r, curr_col+1).border = bd; current_r += 1
-            
-            for d_item in month_deducts:
-                amt = deduct_df[deduct_df['備註']==d_item]['金額'].sum()
-                val = amt if amt > 0 else ""
-                ws.merge_cells(start_row=current_r, start_column=curr_col, end_row=current_r, end_column=curr_col+1)
-                c_val = ws.cell(current_r, curr_col, val); c_val.border = bd; c_val.alignment = align_c; c_val.font = ft_red
-                ws.cell(current_r, curr_col+1).border = bd; current_r += 1
-
-            for a_item in month_adjusts:
-                has_adj = not adjust_df[adjust_df['備註']==a_item].empty
-                val = "✔️" if has_adj else ""
-                ws.merge_cells(start_row=current_r, start_column=curr_col, end_row=current_r, end_column=curr_col+1)
-                c_val = ws.cell(current_r, curr_col, val); c_val.border = bd; c_val.alignment = align_c
-                ws.cell(current_r, curr_col+1).border = bd; current_r += 1
-            
-            net = sub_1 + bonus_df['金額'].sum() - deduct_df['金額'].sum()
-            ws.merge_cells(start_row=current_r, start_column=curr_col, end_row=current_r, end_column=curr_col+1)
-            c_net = ws.cell(current_r, curr_col, net); c_net.border = bd; c_net.alignment = align_c; c_net.font = ft_bold
-            ws.cell(current_r, curr_col+1).border = bd
-            col_map[p] = curr_col; curr_col += 2
-            
-        # B. 出勤明細
-        start_row = 3 + len(all_labels) + 2
-        ws.merge_cells(f"A{start_row}:C{start_row}"); c=ws.cell(start_row,1,"【出勤明細】"); c.font=ft_head
-        work_only = df_m[df_m['類型']=='手動登錄']
-        dates = sorted(work_only['日期'].unique())
-        
-        ws.cell(start_row+1, 1, "日期").border=bd
-        for p in active_emp:
-            ws.merge_cells(start_row=start_row+1, start_column=col_map[p], end_row=start_row+1, end_column=col_map[p]+1)
-            c = ws.cell(start_row+1, col_map[p], p); c.border=bd; c.alignment=align_c
-            ws.cell(start_row+1, col_map[p]+1).border=bd
-        
-        curr_r = start_row + 2
-        for d in dates:
-            ws.cell(curr_r, 1, d.strftime("%m月%d日")).border=bd
-            day_data = work_only[work_only['日期'] == d]
-            for p in active_emp:
-                rec = day_data[day_data['姓名'] == p]
-                txt = ""
-                if not rec.empty:
-                    locs = rec['地點'].tolist(); dys = rec['工時'].tolist()
-                    txt = "\n".join([f"{l} ({d})" for l, d in zip(locs, dys)])
-                ws.merge_cells(start_row=curr_r, start_column=col_map[p], end_row=curr_r, end_column=col_map[p]+1)
-                c = ws.cell(curr_r, col_map[p], txt); c.border=bd; c.alignment=Alignment(wrap_text=True, horizontal='center', vertical='center')
-                ws.cell(curr_r, col_map[p]+1).border=bd
-            curr_r += 1
-            
-        # C. 案場統計 & D. 工項統計
-        i_col = 9
-        ws.merge_cells(start_row=1, start_column=i_col, end_row=1, end_column=i_col+3); c=ws.cell(1, i_col, "【案場統計】"); c.font=ft_head
-        for idx, h in enumerate(["案場", "天數", "人數", "工數"]): ws.cell(2, i_col+idx, h).border=bd
-        site_stats = work_only.groupby('地點').agg({'日期':'nunique', '姓名':'nunique', '工時':'sum'}).reset_index()
-        for idx, row in site_stats.iterrows():
-            for c_idx, val in enumerate([row['地點'], row['日期'], row['姓名'], row['工時']]): ws.cell(idx+3, i_col+c_idx, val).border=bd
-
-        n_col = 14
-        ws.merge_cells(start_row=1, start_column=n_col, end_row=1, end_column=n_col+4); c=ws.cell(1, n_col, "【案場工項統計】"); c.font=ft_head
-        for idx, h in enumerate(["日期", "案場", "工項", "工數", "人數"]): ws.cell(2, n_col+idx, h).border=bd
-        work_only['備註'] = work_only['備註'].replace("", "一般")
-        det_stats = work_only.groupby(['日期', '地點', '備註']).agg({'工時':'sum', '姓名':'nunique'}).reset_index().sort_values('日期')
-        for idx, row in det_stats.iterrows():
-            vals = [row['日期'].strftime("%m/%d"), row['地點'], row['備註'], row['工時'], row['姓名']]
-            for c_idx, val in enumerate(vals): ws.cell(idx+3, n_col+c_idx, val).border=bd
-
-    output = io.BytesIO()
-    wb.save(output)
-    return output.getvalue()
-
 # --- 主介面 ---
 def main():
     st.set_page_config(page_title="工務薪資系統 (Web)", page_icon="🏗️")
     st.title("🏗️ 工務薪資系統")
 
-    menu = st.selectbox("≡ 功能選單", ["📅 工務登錄", "💰 獎金與扣款", "🛠️ 員工管理", "💵 薪資明細瀏覽", "🏗️ 案場統計瀏覽", "📊 報表下載"])
+    # [修改] 移除 "報表下載"，只保留手機需要的 5 個功能
+    menu = st.selectbox("≡ 功能選單", ["📅 工務登錄", "💰 獎金與扣款", "🛠️ 員工管理", "💵 薪資明細瀏覽", "🏗️ 案場統計瀏覽"])
     
-    # [V72 修正] 正確接收 emp_rows
+    # 資料讀取
     employees, salary_map, locations, work_details, money_items, work_rows, s_work, s_emp, emp_rows = load_data()
-    client = init_connection()
 
     if menu == "📅 工務登錄":
         st.subheader("每日出勤登錄")
@@ -448,7 +270,6 @@ def main():
                         st.rerun()
                         break
 
-    # [V73 新功能] 薪資明細瀏覽
     elif menu == "💵 薪資明細瀏覽":
         st.subheader("💵 員工薪資統計")
         col1, col2 = st.columns(2)
@@ -485,7 +306,7 @@ def main():
                 salary_data.append({"姓名": p, "出勤天數": days, "應支(含津貼/獎金)": base+allow+bonus, "扣款": deduct, "實領總額": total})
             st.dataframe(pd.DataFrame(salary_data), hide_index=True)
 
-    # [V73 新功能] 案場統計瀏覽
+    # [V77 修改] 加入成本計算 + 保留工項細目
     elif menu == "🏗️ 案場統計瀏覽":
         st.subheader("🏗️ 案場與工項統計")
         col1, col2 = st.columns(2)
@@ -508,25 +329,19 @@ def main():
         if df.empty:
             st.warning("查無資料")
         else:
-            st.write("📊 **案場總表**")
+            st.write("📊 **案場總表 (含成本估算)**")
             site_stats = df.groupby('地點').agg({'工時':'sum', '姓名':'nunique', '日期':'nunique'}).reset_index()
-            site_stats.columns = ['案場', '總工數', '出工人數', '施工天數']
+            # [修正] 這裡加入成本計算
+            site_stats['粗估成本'] = site_stats['工時'] * COST_PER_WORKER
+            site_stats.columns = ['案場', '總工數', '出工人數', '施工天數', '粗估成本']
             st.dataframe(site_stats, hide_index=True)
+            
             st.divider()
             st.write("🔧 **工項細目**")
             df['備註'] = df['備註'].replace("", "一般出勤")
             detail_stats = df.groupby(['地點', '備註']).agg({'工時':'sum'}).reset_index()
             detail_stats.columns = ['案場', '工項', '總工數']
             st.dataframe(detail_stats, hide_index=True)
-
-    elif menu == "📊 報表下載":
-        st.subheader("Excel 報表匯出")
-        year = st.selectbox("選擇年份", [2025, 2026, 2027], index=1)
-        if st.button("🚀 產生報表", type="primary"):
-            with st.spinner("正在生成 Excel..."):
-                excel_data = generate_excel(year, work_rows, employees)
-                st.success("生成完畢！")
-                st.download_button(label="📥 點此下載檔案", data=excel_data, file_name=f"工務薪資報表_{year}年.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if __name__ == "__main__":
     main()
